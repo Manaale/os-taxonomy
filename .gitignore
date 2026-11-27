@@ -3,3 +3,13 @@ node_modules/
 *.log
 .env
 .env.*
+
+.agents/skills/marble-builder/examples/dist/
+
+# Local player state and generated output
+player/.data/
+player/dist/
+player/artifacts/
+player/.venv/
+**/__pycache__/
+*.pyc

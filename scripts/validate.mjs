@@ -10,9 +10,13 @@
  */
 
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkManifestTopicInventory } from './check-manifest-topic-inventory.mjs';
+import { checkTeachingResearch, checkResearchArchiveReferences } from './check-public-teaching-research.mjs';
+import { findDependencyCycle } from './check-dependency-cycles.mjs';
+import { checkTopicCompatibility } from './check-curriculum-alignments.mjs';
 
 const DATA = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'data');
 const load = (name) => JSON.parse(readFileSync(resolve(DATA, name), 'utf8'));
@@ -30,7 +34,7 @@ const clusters = load('clusters.json');
 const manifest = load('manifest.json');
 
 // --- declared counts match reality -----------------------------------------
-check(topics.topicCount === topics.topics.length, `topics: topicCount ${topics.topicCount} != ${topics.topics.length}`);
+errors.push(...checkManifestTopicInventory(topics, manifest));
 check(deps.edgeCount === deps.dependencies.length, `dependencies: edgeCount ${deps.edgeCount} != ${deps.dependencies.length}`);
 check(standards.curriculumCount === standards.curricula.length, `curricula: curriculumCount != length`);
 check(clusters.clusterCount === clusters.clusters.length, `clusters: clusterCount != length`);
@@ -71,6 +75,10 @@ for (const d of deps.dependencies) {
   check(d.strength === 'hard' || d.strength === 'soft', `bad strength ${d.strength}`);
 }
 
+// --- prerequisite graph must be acyclic (hard and soft edges) ---------------
+const cycle = findDependencyCycle(deps.dependencies);
+check(cycle === null, `dependency cycle: ${cycle?.join(' -> ')}`);
+
 // --- referential integrity: topic → standard -------------------------------
 let danglingRefs = 0;
 for (const t of topics.topics) {
@@ -83,10 +91,38 @@ for (const t of topics.topics) {
 }
 if (danglingRefs > 5) errors.push(`…and ${danglingRefs - 5} more unknown standard references`);
 
+// --- referential integrity: cluster → topic subject/domain ------------------
+const topicDomains = new Set(topics.topics.map(t => JSON.stringify([t.subject, t.domain])));
+for (const c of clusters.clusters) {
+  check(topicDomains.has(JSON.stringify([c.subject, c.domain])),
+    `cluster ${c.subject} / ${c.domain} (age ${c.ageRangeStart}): no topics in this subject/domain`);
+}
+
+// --- teaching research: schema, coverage and exact evidence links -----------
+const research = load('teaching-research.json');
+const researchSchema = JSON.parse(readFileSync(resolve(DATA, '..', 'schema', 'teaching-research.schema.json'), 'utf8'));
+errors.push(...checkTeachingResearch(research, { topics, topicsBytes: bytesOf('topics.json'), manifest, schema: researchSchema }));
+errors.push(...checkResearchArchiveReferences(load('archived-teaching-research.json'), { topics, research }));
+check(Boolean(manifest.files?.['teaching-research.json']), 'manifest missing teaching-research.json checksum');
+
+// Optional during preparation; a declared/present file must be complete and bound.
+const ALIGNMENTS = 'curriculum-alignments.json';
+const hasAlignments = existsSync(resolve(DATA, ALIGNMENTS));
+const declaresAlignments = Object.hasOwn(manifest.files ?? {}, ALIGNMENTS) || Object.hasOwn(manifest.counts ?? {}, 'curriculumAlignments');
+check(hasAlignments || !declaresAlignments, 'manifest declares missing curriculum-alignments.json');
+if (hasAlignments) {
+  const alignments = load(ALIGNMENTS);
+  errors.push(...checkTopicCompatibility(alignments, { topics, curriculumStandards: standards }));
+  check(Boolean(manifest.files?.[ALIGNMENTS]), 'manifest missing curriculum-alignments.json checksum');
+  check(manifest.counts?.curriculumAlignments === alignments?.alignments?.length, 'manifest curriculumAlignments count mismatch');
+}
+
 // --- manifest checksums -----------------------------------------------------
 for (const [name, meta] of Object.entries(manifest.files ?? {})) {
+  if (name === ALIGNMENTS && !hasAlignments) continue; // Missing file already reported above.
   const actual = createHash('sha256').update(bytesOf(name)).digest('hex');
   check(actual === meta.sha256, `checksum mismatch for ${name}`);
+  check(bytesOf(name).length === meta.bytes, `byte count mismatch for ${name}`);
 }
 
 // --- report -----------------------------------------------------------------
@@ -97,6 +133,6 @@ if (errors.length) {
 }
 console.log(
   `✓ valid — ${topics.topics.length} topics, ${deps.dependencies.length} dependencies, ` +
-    `${standardKeys.size} standards, ${clusters.clusters.length} clusters. ` +
-    `Referential integrity + checksums OK.`,
+    `${standardKeys.size} standards, ${clusters.clusters.length} clusters, ${research.recordCount} research records. ` +
+    `Referential integrity + checksums OK. Alignment contract: ${hasAlignments ? 'validated' : 'not supplied (preparation mode)'}.`,
 );
